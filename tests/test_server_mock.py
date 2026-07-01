@@ -1,0 +1,69 @@
+from fastapi.testclient import TestClient
+
+from local_router.server import MOCK_UNCERTAIN_MARKER, ServerConfig, create_app, strip_reasoning_text
+
+
+def test_mock_decision_cache_and_routes() -> None:
+    client = TestClient(create_app(ServerConfig(mock=True, decision_cache_size=8)))
+
+    easy = {"messages": [{"role": "user", "content": "What is 2+2?"}], "max_tokens": 32}
+    first = client.post("/v1/router/decision", json=easy)
+    second = client.post("/v1/router/decision", json=easy)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["route"] == "local"
+    assert first.json()["cache_hit"] is False
+    assert second.json()["route"] == "local"
+    assert second.json()["cache_hit"] is True
+
+    hard = client.post(
+        "/v1/router/decision",
+        json={
+            "messages": [
+                {"role": "system", "content": MOCK_UNCERTAIN_MARKER},
+                {"role": "user", "content": "Route this from synthetic uncertainty."},
+            ],
+            "max_tokens": 32,
+        },
+    )
+
+    assert hard.status_code == 200
+    assert hard.json()["route"] == "remote"
+    assert hard.json()["route_source"] == "entropy"
+
+
+def test_health_exposes_dx_settings() -> None:
+    client = TestClient(create_app(ServerConfig(mock=True, max_concurrency=2, decision_cache_size=4)))
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["generation"]["max_concurrency"] == 2
+    assert payload["decision_cache"]["max_size"] == 4
+
+
+def test_strip_reasoning_text_removes_think_block() -> None:
+    text = "<think>\nI should not show this.\n</think>\nHello!"
+
+    assert strip_reasoning_text(text) == "Hello!"
+
+
+def test_strip_reasoning_text_hides_unclosed_think_block() -> None:
+    text = "<think>\nI am still reasoning and never produced a final answer."
+
+    assert strip_reasoning_text(text) == ""
+
+
+def test_natural_prompt_still_uses_entropy_path() -> None:
+    client = TestClient(create_app(ServerConfig(mock=True, decision_cache_size=0)))
+
+    response = client.post(
+        "/v1/router/decision",
+        json={"messages": [{"role": "user", "content": "what is grpo in post training"}], "max_tokens": 32},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["route_source"] == "entropy"
+    assert "task gate" not in response.json()["reason"]
