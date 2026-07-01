@@ -1,6 +1,13 @@
 from fastapi.testclient import TestClient
 
-from local_router.server import MOCK_UNCERTAIN_MARKER, ServerConfig, create_app, strip_reasoning_text
+from local_router.server import (
+    MOCK_UNCERTAIN_MARKER,
+    ServerConfig,
+    create_app,
+    prepare_probe_messages,
+    strip_reasoning_text,
+    strip_router_trace_text,
+)
 
 
 def test_mock_decision_cache_and_routes() -> None:
@@ -54,6 +61,36 @@ def test_strip_reasoning_text_hides_unclosed_think_block() -> None:
     text = "<think>\nI am still reasoning and never produced a final answer."
 
     assert strip_reasoning_text(text) == ""
+
+
+def test_strip_router_trace_text_removes_trace_line() -> None:
+    text = "> router: route=remote | model=cloud | confidence=0.000\n\nFinal answer."
+
+    assert strip_router_trace_text(text) == "Final answer."
+
+
+def test_prepare_probe_messages_cleans_remote_trace_and_bounds_context() -> None:
+    messages = [
+        {"role": "user", "content": "Give a detailed remote answer."},
+        {
+            "role": "assistant",
+            "content": (
+                "> router: route=remote | model=cloud | confidence=0.000\n\n"
+                "<think>hidden reasoning</think>\n"
+                + "A" * 300
+                + "\nThe answer was Paris."
+            ),
+        },
+        {"role": "user", "content": "What city was mentioned?"},
+    ]
+
+    prepared = prepare_probe_messages(messages, max_context_chars=260, max_message_chars=160)
+
+    assert prepared[-1] == {"role": "user", "content": "What city was mentioned?"}
+    assistant = next(message for message in prepared if message["role"] == "assistant")
+    assert "router:" not in assistant["content"]
+    assert "hidden reasoning" not in assistant["content"]
+    assert len("\n".join(message["content"] for message in prepared)) <= 260
 
 
 def test_natural_prompt_still_uses_entropy_path() -> None:

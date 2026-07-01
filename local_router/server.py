@@ -24,6 +24,7 @@ from .confidence import ConfidenceMetrics, choose_route, summarize_confidence
 DEFAULT_MODEL_ID = "local-model"
 DEFAULT_BACKEND_BASE_URL = "http://127.0.0.1:8081/v1"
 MOCK_UNCERTAIN_MARKER = "[mock-router:uncertain]"
+ROUTER_TRACE_LINE_RE = re.compile(r"^\s*[>|│]?\s*router:\s*route=.*(?:\n|$)", re.IGNORECASE | re.MULTILINE)
 THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.IGNORECASE | re.DOTALL)
 THINK_OPEN_RE = re.compile(r"<think\b[^>]*>", re.IGNORECASE)
 THINK_CLOSE_RE = re.compile(r"</think\s*>", re.IGNORECASE)
@@ -42,6 +43,8 @@ class ServerConfig:
     confidence_threshold: float = 0.97
     top_logprobs: int = 20
     request_timeout_s: float = 120.0
+    probe_max_context_chars: int = 12_000
+    probe_max_message_chars: int = 4_000
     max_concurrency: int = 1
     decision_cache_size: int = 128
     mock: bool = False
@@ -119,6 +122,61 @@ def strip_reasoning_text(text: str) -> str:
     without_blocks = THINK_BLOCK_RE.sub("", stripped)
     without_tags = THINK_OPEN_RE.sub("", THINK_CLOSE_RE.sub("", without_blocks))
     return without_tags.strip()
+
+
+def strip_router_trace_text(text: str) -> str:
+    return ROUTER_TRACE_LINE_RE.sub("", text).strip()
+
+
+def sanitize_probe_text(text: str, role: str) -> str:
+    stripped = strip_router_trace_text(text)
+    if role == "assistant":
+        stripped = strip_reasoning_text(stripped)
+    return stripped.strip()
+
+
+def trim_middle(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    marker = "\n[...omitted...]\n"
+    side = max(1, (max_chars - len(marker)) // 2)
+    return f"{text[:side].rstrip()}{marker}{text[-side:].lstrip()}"
+
+
+def prepare_probe_messages(
+    messages: list[dict[str, Any]],
+    *,
+    max_context_chars: int,
+    max_message_chars: int,
+) -> list[dict[str, Any]]:
+    prepared: list[dict[str, str]] = []
+    for message in messages:
+        role = str(message.get("role", "user"))
+        if role not in {"system", "user", "assistant"}:
+            role = "user"
+        content = sanitize_probe_text(_message_content_to_text(message.get("content", "")), role)
+        if not content:
+            continue
+        prepared.append({"role": role, "content": trim_middle(content, max_message_chars)})
+
+    if max_context_chars <= 0:
+        return prepared
+
+    selected: list[dict[str, str]] = []
+    used = 0
+    for message in reversed(prepared):
+        content = message["content"]
+        cost = len(content) + len(message["role"]) + 2
+        remaining = max_context_chars - used
+        if remaining <= 0:
+            break
+        if cost > remaining:
+            if not selected and remaining > 200:
+                selected.append({**message, "content": trim_middle(content, remaining)})
+            continue
+        selected.append(message)
+        used += cost
+    return list(reversed(selected))
 
 
 def _logprob_entropy(logprobs: list[float]) -> tuple[float, float] | None:
@@ -318,6 +376,8 @@ def create_app(config: ServerConfig) -> FastAPI:
                 "max_concurrency": config.max_concurrency,
                 "max_local_tokens": config.max_local_tokens,
                 "top_logprobs": config.top_logprobs,
+                "probe_max_context_chars": config.probe_max_context_chars,
+                "probe_max_message_chars": config.probe_max_message_chars,
             },
             "decision_cache": decision_cache.stats(),
         }
@@ -340,7 +400,12 @@ def create_app(config: ServerConfig) -> FastAPI:
     async def decision(request: Request) -> dict[str, Any]:
         started = time.perf_counter()
         payload = await request.json()
-        messages = _messages(payload)
+        raw_messages = _messages(payload)
+        messages = prepare_probe_messages(
+            raw_messages,
+            max_context_chars=config.probe_max_context_chars,
+            max_message_chars=config.probe_max_message_chars,
+        )
         max_tokens = _max_tokens(payload, config.max_local_tokens)
         temperature = float(payload.get("temperature", 0.2))
         entropy_threshold = float(payload.get("entropy_threshold", config.entropy_threshold))
@@ -376,6 +441,11 @@ def create_app(config: ServerConfig) -> FastAPI:
             "route_source": "entropy",
             "metrics": asdict(result.metrics),
             "usage": _usage(result),
+            "probe": {
+                "input_messages": len(raw_messages),
+                "messages": len(messages),
+                "chars": sum(len(str(message.get("content", ""))) for message in messages),
+            },
             "cache_hit": False,
             "latency_ms": round((time.perf_counter() - started) * 1000, 3),
         }
@@ -519,6 +589,16 @@ def parse_args() -> ServerConfig:
         "--request-timeout-s",
         type=float,
         default=float(os.environ.get("LOCAL_ROUTER_REQUEST_TIMEOUT_S", "120")),
+    )
+    parser.add_argument(
+        "--probe-max-context-chars",
+        type=int,
+        default=int(os.environ.get("LOCAL_ROUTER_PROBE_MAX_CONTEXT_CHARS", "12000")),
+    )
+    parser.add_argument(
+        "--probe-max-message-chars",
+        type=int,
+        default=int(os.environ.get("LOCAL_ROUTER_PROBE_MAX_MESSAGE_CHARS", "4000")),
     )
     parser.add_argument(
         "--max-concurrency",

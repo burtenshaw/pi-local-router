@@ -29,6 +29,7 @@ const TOP1_THRESHOLD = envFloat("ROUTER_TOP1_THRESHOLD", 0.95);
 const CONFIDENCE_THRESHOLD = envFloat("ROUTER_CONFIDENCE_THRESHOLD", 0.97);
 const FAIL_OPEN_TO_REMOTE = (process.env.ROUTER_FAIL_OPEN ?? "remote").toLowerCase() === "remote";
 const SHOW_TRACE = envBool("ROUTER_SHOW_TRACE", true);
+const ROUTER_TRACE_LINE_RE = /^\s*[>|│]?\s*router:\s*route=.*(?:\n|$)/gim;
 
 type Route = "local" | "remote";
 
@@ -94,8 +95,12 @@ function contentToText(content: Message["content"]): string {
 		.join("\n");
 }
 
+function stripRouterTrace(text: string): string {
+	return text.replace(ROUTER_TRACE_LINE_RE, "").trim();
+}
+
 function assistantText(message: Extract<Message, { role: "assistant" }>): string {
-	return message.content
+	const text = message.content
 		.map((part) => {
 			if (part.type === "text") return part.text;
 			if (part.type === "toolCall") return `[tool call: ${part.name}]`;
@@ -103,6 +108,7 @@ function assistantText(message: Extract<Message, { role: "assistant" }>): string
 		})
 		.filter(Boolean)
 		.join("\n");
+	return stripRouterTrace(text);
 }
 
 function toOpenAIProbeMessages(context: Context): Array<{ role: "system" | "user" | "assistant"; content: string }> {
@@ -358,7 +364,7 @@ function remoteModelFor(model: Model<Api>): Model<"openai-completions"> {
 	return {
 		...model,
 		id: REMOTE_MODEL,
-			name: `Hugging Face remote (${REMOTE_MODEL})`,
+		name: `Hugging Face remote (${REMOTE_MODEL})`,
 		api: "openai-completions",
 		baseUrl: REMOTE_BASE_URL,
 		contextWindow: ROUTER_CONTEXT_WINDOW,
@@ -418,14 +424,14 @@ function streamEntropyRouter(model: Model<Api>, context: Context, options?: Simp
 
 export default function (pi: ExtensionAPI) {
 	pi.registerProvider(PROVIDER_ID, {
-		name: "Entropy Router",
+		name: "Local Router",
 		baseUrl: REMOTE_BASE_URL,
 		apiKey: ROUTER_PROVIDER_API_KEY,
 		api: "local-router-api",
 		models: [
 			{
 				id: ROUTER_MODEL_ID,
-					name: "Local model -> Hugging Face router",
+				name: "Local model -> Hugging Face router",
 				reasoning: false,
 				input: ["text"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
