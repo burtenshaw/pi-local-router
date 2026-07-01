@@ -22,6 +22,7 @@ class EvalResult:
     case_id: str
     expected_route: str
     actual_route: str
+    route_source: str
     passed: bool
     confidence: float
     latency_ms: float
@@ -118,6 +119,7 @@ def run_case(client: RouterClient, case: dict[str, Any], max_tokens: int, temper
         case_id=str(case["id"]),
         expected_route=expected_route,
         actual_route=actual_route,
+        route_source=str(decision.get("route_source", "")),
         passed=actual_route == expected_route,
         confidence=float(decision.get("confidence", 0.0)),
         latency_ms=latency_ms,
@@ -127,13 +129,14 @@ def run_case(client: RouterClient, case: dict[str, Any], max_tokens: int, temper
 
 
 def print_results(results: list[EvalResult]) -> None:
-    print("case_id              expected  actual  pass  conf   ms      cache  reason")
-    print("-" * 96)
+    print("case_id              expected  actual  source               pass  conf   ms      cache  reason")
+    print("-" * 116)
     for result in results:
         print(
             f"{result.case_id[:20]:20} "
             f"{result.expected_route:8} "
             f"{result.actual_route:6} "
+            f"{result.route_source[:20]:20} "
             f"{'yes' if result.passed else 'no ':4} "
             f"{result.confidence:0.3f} "
             f"{result.latency_ms:7.2f} "

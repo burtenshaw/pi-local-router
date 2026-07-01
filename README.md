@@ -2,7 +2,7 @@
 
 Pi extension that routes between a local llama.cpp model and a remote Hugging Face Inference Providers model.
 
-The router first asks the local model for a short answer with logprobs enabled. If local token entropy/top-1 confidence passes the configured thresholds, Pi returns the local answer. Otherwise Pi sends the same conversation to the remote Hugging Face model.
+The router first asks the local model to classify whether the current request is safe for local handling. If that route probe passes, it asks the local model for a short answer with logprobs enabled. Pi returns the local answer only when both the route probe and token entropy/top-1 confidence pass. Otherwise Pi sends the same conversation to the remote Hugging Face model.
 
 ## Setup
 
@@ -63,6 +63,9 @@ export ROUTER_TOP1_THRESHOLD=0.95
 export ROUTER_CONFIDENCE_THRESHOLD=0.97
 export ROUTER_SHOW_TRACE=1
 export ROUTER_AUTO_SELECT=1
+export LOCAL_ROUTER_ROUTE_PROBE=1
+export LOCAL_ROUTER_ROUTE_PROBE_CONFIDENCE_THRESHOLD=0.80
+export LOCAL_ROUTER_ROUTE_PROBE_MAX_TOKENS=64
 export LOCAL_ROUTER_PROBE_MAX_CONTEXT_CHARS=12000
 export LOCAL_ROUTER_PROBE_MAX_MESSAGE_CHARS=4000
 ```

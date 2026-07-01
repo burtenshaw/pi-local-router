@@ -28,6 +28,17 @@ ROUTER_TRACE_LINE_RE = re.compile(r"^\s*[>|│]?\s*router:\s*route=.*(?:\n|$)", 
 THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.IGNORECASE | re.DOTALL)
 THINK_OPEN_RE = re.compile(r"<think\b[^>]*>", re.IGNORECASE)
 THINK_CLOSE_RE = re.compile(r"</think\s*>", re.IGNORECASE)
+ROUTE_PROBE_SYSTEM_PROMPT = """You are a routing classifier for a small local language model.
+
+Choose LOCAL only when the current user request can be answered reliably by a small local model using:
+- ordinary conversation or greetings
+- simple arithmetic, formatting, or rewriting
+- direct summaries or transformations of supplied text
+- follow-up questions whose answer is already present in the conversation
+
+Choose REMOTE when the request needs specialized factual, research, technical, current, high-stakes, or long-reasoning knowledge, when an acronym or term is ambiguous, or when you are not sure the small local model can answer correctly.
+
+Output exactly one word: LOCAL or REMOTE."""
 
 
 @dataclass
@@ -45,6 +56,9 @@ class ServerConfig:
     request_timeout_s: float = 120.0
     probe_max_context_chars: int = 12_000
     probe_max_message_chars: int = 4_000
+    route_probe_enabled: bool = True
+    route_probe_confidence_threshold: float = 0.80
+    route_probe_max_tokens: int = 64
     max_concurrency: int = 1
     decision_cache_size: int = 128
     mock: bool = False
@@ -56,6 +70,18 @@ class GenerationResult:
     prompt_tokens: int
     completion_tokens: int
     metrics: ConfidenceMetrics
+    raw_text: str = ""
+
+
+@dataclass
+class RouteProbeResult:
+    route: str
+    label: str
+    confidence: float
+    reason: str
+    metrics: ConfidenceMetrics
+    usage: dict[str, int]
+    text: str
 
 
 class DecisionCache:
@@ -179,6 +205,25 @@ def prepare_probe_messages(
     return list(reversed(selected))
 
 
+def route_probe_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {"role": "system", "content": ROUTE_PROBE_SYSTEM_PROMPT},
+        *messages,
+        {
+            "role": "user",
+            "content": (
+                "Classify whether the local small model should answer the current user request. "
+                "Do not think step by step. Do not explain. Output exactly LOCAL or REMOTE."
+            ),
+        },
+    ]
+
+
+def parse_route_probe_label(text: str) -> str:
+    matches = re.findall(r"\b(LOCAL|REMOTE)\b", text.upper())
+    return matches[-1].lower() if matches else "invalid"
+
+
 def _logprob_entropy(logprobs: list[float]) -> tuple[float, float] | None:
     probs = [math.exp(value) for value in logprobs if math.isfinite(value)]
     probs = [min(max(value, 0.0), 1.0) for value in probs if value > 0.0]
@@ -264,6 +309,19 @@ class MockRouterModel:
     async def generate(self, messages: list[dict[str, Any]], max_new_tokens: int, temperature: float) -> GenerationResult:
         prompt = messages_to_plain_prompt(messages)
         uncertain = MOCK_UNCERTAIN_MARKER in prompt
+        is_route_probe = ROUTE_PROBE_SYSTEM_PROMPT in prompt
+        if is_route_probe:
+            text = "REMOTE" if uncertain else "LOCAL"
+            entropies = [0.08] if not uncertain else [0.12]
+            top1 = [0.97] if not uncertain else [0.96]
+            metrics = summarize_confidence(entropies, top1, vocab_size=128_000)
+            return GenerationResult(
+                text=text,
+                prompt_tokens=max(1, len(prompt.split())),
+                completion_tokens=1,
+                metrics=metrics,
+                raw_text=text,
+            )
         text = (
             "This synthetic mock completion has low confidence and should delegate to the remote model."
             if uncertain
@@ -277,6 +335,7 @@ class MockRouterModel:
             prompt_tokens=max(1, len(prompt.split())),
             completion_tokens=max(1, len(text.split())),
             metrics=metrics,
+            raw_text=text,
         )
 
 
@@ -347,6 +406,7 @@ class OpenAICompatibleRouterModel:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             metrics=metrics,
+            raw_text=raw_text,
         )
 
 
@@ -359,6 +419,31 @@ def create_app(config: ServerConfig) -> FastAPI:
     async def generate(messages: list[dict[str, Any]], max_tokens: int, temperature: float) -> GenerationResult:
         async with generation_semaphore:
             return await model.generate(messages, max_tokens, temperature)
+
+    async def classify_route(messages: list[dict[str, Any]], confidence_threshold: float) -> RouteProbeResult:
+        result = await generate(route_probe_messages(messages), config.route_probe_max_tokens, 0.0)
+        route_text = result.raw_text or result.text
+        label = parse_route_probe_label(route_text)
+        confidence = result.metrics.confidence
+        route = "local" if label == "local" and confidence >= confidence_threshold else "remote"
+        if label not in {"local", "remote"}:
+            reason = f"route probe invalid label: {route_text!r}"
+        elif confidence < confidence_threshold:
+            reason = (
+                f"route probe confidence low: label={label}, confidence={confidence:.3f}, "
+                f"threshold={confidence_threshold:.3f}"
+            )
+        else:
+            reason = f"route probe chose {label}: confidence={confidence:.3f}"
+        return RouteProbeResult(
+            route=route,
+            label=label,
+            confidence=confidence,
+            reason=reason,
+            metrics=result.metrics,
+            usage=_usage(result),
+            text=route_text,
+        )
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -378,6 +463,9 @@ def create_app(config: ServerConfig) -> FastAPI:
                 "top_logprobs": config.top_logprobs,
                 "probe_max_context_chars": config.probe_max_context_chars,
                 "probe_max_message_chars": config.probe_max_message_chars,
+                "route_probe_enabled": config.route_probe_enabled,
+                "route_probe_confidence_threshold": config.route_probe_confidence_threshold,
+                "route_probe_max_tokens": config.route_probe_max_tokens,
             },
             "decision_cache": decision_cache.stats(),
         }
@@ -411,6 +499,10 @@ def create_app(config: ServerConfig) -> FastAPI:
         entropy_threshold = float(payload.get("entropy_threshold", config.entropy_threshold))
         top1_threshold = float(payload.get("top1_threshold", config.top1_threshold))
         confidence_threshold = float(payload.get("confidence_threshold", config.confidence_threshold))
+        route_probe_enabled = _payload_bool(payload, "route_probe_enabled", config.route_probe_enabled)
+        route_probe_confidence_threshold = float(
+            payload.get("route_probe_confidence_threshold", config.route_probe_confidence_threshold)
+        )
         cache_key = _decision_cache_key(
             config.model_id,
             config.backend_base_url,
@@ -420,6 +512,9 @@ def create_app(config: ServerConfig) -> FastAPI:
             entropy_threshold,
             top1_threshold,
             confidence_threshold,
+            route_probe_enabled,
+            route_probe_confidence_threshold,
+            config.route_probe_max_tokens,
         )
         cached = decision_cache.get(cache_key)
         if cached is not None:
@@ -427,20 +522,60 @@ def create_app(config: ServerConfig) -> FastAPI:
             cached["latency_ms"] = round((time.perf_counter() - started) * 1000, 3)
             return cached
 
+        route_probe = None
+        if route_probe_enabled:
+            route_probe = await classify_route(messages, route_probe_confidence_threshold)
+            if route_probe.route == "remote":
+                response = {
+                    "route": "remote",
+                    "text": "",
+                    "model": config.model_id,
+                    "confidence": route_probe.confidence,
+                    "reason": route_probe.reason,
+                    "route_source": "route_probe",
+                    "metrics": asdict(route_probe.metrics),
+                    "usage": route_probe.usage,
+                    "route_probe": {
+                        "enabled": True,
+                        "label": route_probe.label,
+                        "confidence": route_probe.confidence,
+                        "threshold": route_probe_confidence_threshold,
+                        "text": route_probe.text,
+                    },
+                    "probe": {
+                        "input_messages": len(raw_messages),
+                        "messages": len(messages),
+                        "chars": sum(len(str(message.get("content", ""))) for message in messages),
+                    },
+                    "cache_hit": False,
+                    "latency_ms": round((time.perf_counter() - started) * 1000, 3),
+                }
+                decision_cache.set(cache_key, response)
+                return response
+
         result = await generate(messages, max_tokens, temperature)
         route, reason = choose_route(result.metrics, entropy_threshold, top1_threshold, confidence_threshold)
         if route == "local" and not result.text.strip():
             route = "remote"
             reason = "local final answer empty after stripping reasoning"
+        if route_probe is not None:
+            reason = f"{route_probe.reason}; {reason}"
         response = {
             "route": route,
             "text": result.text if route == "local" else "",
             "model": config.model_id,
             "confidence": result.metrics.confidence,
             "reason": reason,
-            "route_source": "entropy",
+            "route_source": "route_probe+entropy" if route_probe is not None else "entropy",
             "metrics": asdict(result.metrics),
             "usage": _usage(result),
+            "route_probe": {
+                "enabled": route_probe is not None,
+                "label": route_probe.label if route_probe is not None else None,
+                "confidence": route_probe.confidence if route_probe is not None else None,
+                "threshold": route_probe_confidence_threshold if route_probe is not None else None,
+                "text": route_probe.text if route_probe is not None else None,
+            },
             "probe": {
                 "input_messages": len(raw_messages),
                 "messages": len(messages),
@@ -486,6 +621,9 @@ def _decision_cache_key(
     entropy_threshold: float,
     top1_threshold: float,
     confidence_threshold: float,
+    route_probe_enabled: bool,
+    route_probe_confidence_threshold: float,
+    route_probe_max_tokens: int,
 ) -> str:
     body = {
         "model": model_id,
@@ -496,9 +634,30 @@ def _decision_cache_key(
         "entropy_threshold": entropy_threshold,
         "top1_threshold": top1_threshold,
         "confidence_threshold": confidence_threshold,
+        "route_probe_enabled": route_probe_enabled,
+        "route_probe_confidence_threshold": route_probe_confidence_threshold,
+        "route_probe_max_tokens": route_probe_max_tokens,
     }
     encoded = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _payload_bool(payload: dict[str, Any], key: str, default: bool) -> bool:
+    raw = payload.get(key)
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(raw)
 
 
 def _max_tokens(payload: dict[str, Any], fallback: int) -> int:
@@ -599,6 +758,23 @@ def parse_args() -> ServerConfig:
         "--probe-max-message-chars",
         type=int,
         default=int(os.environ.get("LOCAL_ROUTER_PROBE_MAX_MESSAGE_CHARS", "4000")),
+    )
+    parser.add_argument(
+        "--route-probe",
+        dest="route_probe_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("LOCAL_ROUTER_ROUTE_PROBE", True),
+        help="Ask the local model to classify whether the request is safe for local handling before answer generation.",
+    )
+    parser.add_argument(
+        "--route-probe-confidence-threshold",
+        type=float,
+        default=float(os.environ.get("LOCAL_ROUTER_ROUTE_PROBE_CONFIDENCE_THRESHOLD", "0.80")),
+    )
+    parser.add_argument(
+        "--route-probe-max-tokens",
+        type=int,
+        default=int(os.environ.get("LOCAL_ROUTER_ROUTE_PROBE_MAX_TOKENS", "64")),
     )
     parser.add_argument(
         "--max-concurrency",

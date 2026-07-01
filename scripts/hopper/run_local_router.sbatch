@@ -121,6 +121,13 @@ PY
 )"
 fi
 
+ROUTE_PROBE_ARGS=(--route-probe)
+case "${LOCAL_ROUTER_ROUTE_PROBE:-1}" in
+  0|false|False|FALSE|no|No|NO|off|Off|OFF)
+    ROUTE_PROBE_ARGS=(--no-route-probe)
+    ;;
+esac
+
 python -m local_router.server \
   --host 0.0.0.0 \
   --port "$LOCAL_ROUTER_PORT" \
@@ -133,5 +140,8 @@ python -m local_router.server \
   --top-logprobs "${LOCAL_ROUTER_TOP_LOGPROBS:-20}" \
   --probe-max-context-chars "${LOCAL_ROUTER_PROBE_MAX_CONTEXT_CHARS:-12000}" \
   --probe-max-message-chars "${LOCAL_ROUTER_PROBE_MAX_MESSAGE_CHARS:-4000}" \
+  "${ROUTE_PROBE_ARGS[@]}" \
+  --route-probe-confidence-threshold "${LOCAL_ROUTER_ROUTE_PROBE_CONFIDENCE_THRESHOLD:-0.80}" \
+  --route-probe-max-tokens "${LOCAL_ROUTER_ROUTE_PROBE_MAX_TOKENS:-64}" \
   --max-concurrency "${LOCAL_ROUTER_MAX_CONCURRENCY:-1}" \
   --decision-cache-size "${LOCAL_ROUTER_DECISION_CACHE_SIZE:-128}"
