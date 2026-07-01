@@ -27,9 +27,11 @@ const ROUTER_MAX_TOKENS = envInt("ROUTER_MAX_TOKENS", 8_192);
 const ENTROPY_THRESHOLD = envFloat("ROUTER_ENTROPY_THRESHOLD", 0.12);
 const TOP1_THRESHOLD = envFloat("ROUTER_TOP1_THRESHOLD", 0.95);
 const CONFIDENCE_THRESHOLD = envFloat("ROUTER_CONFIDENCE_THRESHOLD", 0.97);
+const AUTO_SELECT = envBool("ROUTER_AUTO_SELECT", false);
 const FAIL_OPEN_TO_REMOTE = (process.env.ROUTER_FAIL_OPEN ?? "remote").toLowerCase() === "remote";
 const SHOW_TRACE = envBool("ROUTER_SHOW_TRACE", true);
 const ROUTER_TRACE_LINE_RE = /^\s*[>|│]?\s*router:\s*route=.*(?:\n|$)/gim;
+const ROUTER_MODEL_NAME = `${PROVIDER_ID}/${ROUTER_MODEL_ID}`;
 
 type Route = "local" | "remote";
 
@@ -206,6 +208,15 @@ function finiteMetric(value: number | undefined): number | undefined {
 
 function routeResponseModel(decision: RouterDecision): string {
 	return decision.route === "local" ? decision.model ?? LOCAL_MODEL : REMOTE_MODEL;
+}
+
+function modelName(model: Model<Api> | undefined): string {
+	if (!model) return "none";
+	return `${model.provider}/${model.id}`;
+}
+
+function isRouterModel(model: Model<Api> | undefined): boolean {
+	return model?.provider === PROVIDER_ID && model.id === ROUTER_MODEL_ID;
 }
 
 function routeTraceText(decision: RouterDecision): string {
@@ -423,6 +434,38 @@ function streamEntropyRouter(model: Model<Api>, context: Context, options?: Simp
 }
 
 export default function (pi: ExtensionAPI) {
+	async function selectRouterModel(ctx: { modelRegistry: { find(provider: string, modelId: string): Model<Api> | undefined }; ui: { notify(message: string, type?: "info" | "warning" | "error"): void } }): Promise<boolean> {
+		const routerModel = ctx.modelRegistry.find(PROVIDER_ID, ROUTER_MODEL_ID);
+		if (!routerModel) {
+			ctx.ui.notify(`[local-router] router model ${ROUTER_MODEL_NAME} is not registered`, "error");
+			return false;
+		}
+		const selected = await pi.setModel(routerModel);
+		if (!selected) {
+			ctx.ui.notify(`[local-router] could not select ${ROUTER_MODEL_NAME}`, "error");
+			return false;
+		}
+		return true;
+	}
+
+	function updateRouterStatus(ctx: {
+		model: Model<Api> | undefined;
+		ui: {
+			notify(message: string, type?: "info" | "warning" | "error"): void;
+			setStatus(key: string, text: string | undefined): void;
+		};
+	}): void {
+		if (isRouterModel(ctx.model)) {
+			ctx.ui.setStatus("local-router", `router active: ${ROUTER_MODEL_NAME}`);
+			return;
+		}
+		ctx.ui.setStatus("local-router", `router inactive: use --model ${ROUTER_MODEL_NAME}`);
+		ctx.ui.notify(
+			`[local-router] extension loaded, but active model is ${modelName(ctx.model)}. Start with --model ${ROUTER_MODEL_NAME} or run /router-use.`,
+			"warning",
+		);
+	}
+
 	pi.registerProvider(PROVIDER_ID, {
 		name: "Local Router",
 		baseUrl: REMOTE_BASE_URL,
@@ -440,6 +483,36 @@ export default function (pi: ExtensionAPI) {
 			},
 		],
 		streamSimple: streamEntropyRouter,
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		if (isRouterModel(ctx.model)) {
+			updateRouterStatus(ctx);
+			return;
+		}
+		if (AUTO_SELECT && (await selectRouterModel(ctx))) {
+			ctx.ui.notify(`[local-router] selected ${ROUTER_MODEL_NAME}`, "info");
+			return;
+		}
+		updateRouterStatus(ctx);
+	});
+
+	pi.on("model_select", (_event, ctx) => {
+		if (isRouterModel(ctx.model)) {
+			ctx.ui.setStatus("local-router", `router active: ${ROUTER_MODEL_NAME}`);
+		} else {
+			ctx.ui.setStatus("local-router", `router inactive: use /router-use`);
+		}
+	});
+
+	pi.registerCommand("router-use", {
+		description: "Switch this session to the local router model",
+		handler: async (_args, ctx) => {
+			if (await selectRouterModel(ctx)) {
+				ctx.ui.setStatus("local-router", `router active: ${ROUTER_MODEL_NAME}`);
+				ctx.ui.notify(`[local-router] selected ${ROUTER_MODEL_NAME}`, "info");
+			}
+		},
 	});
 
 	pi.registerCommand("router-status", {

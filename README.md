@@ -44,10 +44,16 @@ export ROUTER_LOCAL_MODEL="$MODEL_ID"
 export ROUTER_REMOTE_MODEL=zai-org/GLM-5.2:fastest
 export ROUTER_LOCAL_BASE_URL=http://127.0.0.1:8080/v1
 
+scripts/pi-router.sh
+```
+
+Or run the explicit Pi command:
+
+```bash
 pi -e /path/to/pi-local-router --model local-router/local-to-hf
 ```
 
-Inside Pi, run `/router-status` to check the local router.
+The Pi footer should show `(local-router) local-to-hf`. If it shows a built-in provider such as `(huggingface) zai-org/GLM-5.2`, Pi is bypassing the router. Inside Pi, run `/router-use` to switch to the router model and `/router-status` to check the local router server.
 
 ## Useful Knobs
 
@@ -56,6 +62,7 @@ export ROUTER_ENTROPY_THRESHOLD=0.12
 export ROUTER_TOP1_THRESHOLD=0.95
 export ROUTER_CONFIDENCE_THRESHOLD=0.97
 export ROUTER_SHOW_TRACE=1
+export ROUTER_AUTO_SELECT=1
 export LOCAL_ROUTER_PROBE_MAX_CONTEXT_CHARS=12000
 export LOCAL_ROUTER_PROBE_MAX_MESSAGE_CHARS=4000
 ```
